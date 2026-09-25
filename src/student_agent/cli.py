@@ -40,24 +40,47 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    remaining_case_ids = [
+        cid for cid in case_set.case_ids if not (output_root / f"{cid}.json").exists()
+    ]
+    max_retries = 10
+    retry_count = 0
+
+    while remaining_case_ids:
+        try:
+            async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
+                discovered_tools = await gateway.list_tools()
+                if not discovered_tools:
+                    raise RuntimeError("MCP Gateway returned no tools")
+                while remaining_case_ids:
+                    case_id = remaining_case_ids[0]
+                    target = output_root / f"{case_id}.json"
+                    if target.exists():
+                        remaining_case_ids.pop(0)
+                        continue
+                    case = case_set.cases[case_id]
+                    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                    output = await solve_case(case, gateway, trace)
+                    contracts.validate_output(output, f"outputs/{case_id}.json")
+                    if output.get("case_id") != case_id:
+                        raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                    temporary = target.with_suffix(".json.tmp")
+                    temporary.write_text(
+                        json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                    )
+                    temporary.replace(target)
+                    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                    print(f"[{len(case_set.case_ids) - len(remaining_case_ids) + 1}/{len(case_set.case_ids)}] Completed {case_id}")
+                    remaining_case_ids.pop(0)
+                    retry_count = 0
+        except Exception as exc:
+            if not remaining_case_ids:
+                break
+            retry_count += 1
+            if retry_count > max_retries:
+                raise RuntimeError(f"Exceeded max retries ({max_retries}) due to network errors: {exc}") from exc
+            print(f"Network glitch ({exc}), reconnecting gateway in 3s (retry {retry_count}/{max_retries})...")
+            await asyncio.sleep(3)
 
 
 def parser() -> argparse.ArgumentParser:
